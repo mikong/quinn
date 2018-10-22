@@ -12,7 +12,8 @@ use slog::{self, Logger};
 
 use coding::BufMutExt;
 use connection::{
-    state, Connection, ConnectionError, ConnectionHandle, ReadError, State, WriteError,
+    state, Connection, ConnectionConfig, ConnectionError, ConnectionHandle, ReadError, State,
+    WriteError,
 };
 use crypto::{self, reset_token_for, ClientConfig, ConnectError, Crypto, ServerConfig};
 use packet::{
@@ -470,8 +471,16 @@ impl Endpoint {
         let local_id = ConnectionId::random(&mut self.ctx.rng, LOCAL_ID_LEN as u8);
         let remote_id = ConnectionId::random(&mut self.ctx.rng, MAX_CID_SIZE as u8);
         trace!(self.ctx.log, "initial dcid"; "value" => %remote_id);
-        let conn = self.add_connection(remote_id, local_id, remote_id, remote, Side::Client);
-        self.connections[conn.0].connect(&self.ctx, config, server_name)?;
+        let conn = self.add_connection(
+            remote_id,
+            local_id,
+            remote_id,
+            remote,
+            ConnectionConfig::Client {
+                config,
+                server_name,
+            },
+        );
         self.ctx.dirty_conns.insert(conn);
         Ok(conn)
     }
@@ -482,7 +491,7 @@ impl Endpoint {
         local_id: ConnectionId,
         remote_id: ConnectionId,
         remote: SocketAddrV6,
-        side: Side,
+        conn_config: ConnectionConfig,
     ) -> ConnectionHandle {
         debug_assert!(!local_id.is_empty());
         let packet_num = self.ctx.gen_initial_packet_num();
@@ -495,8 +504,8 @@ impl Endpoint {
                 remote_id,
                 remote,
                 packet_num.into(),
-                side,
-                &self.ctx.config,
+                conn_config,
+                &mut self.ctx,
                 conn,
             ));
             conn
@@ -548,7 +557,13 @@ impl Endpoint {
             return;
         }
 
-        let conn = self.add_connection(dest_id, local_id, source_id, remote, Side::Server);
+        let conn = self.add_connection(
+            dest_id,
+            local_id,
+            source_id,
+            remote,
+            ConnectionConfig::Server,
+        );
         self.connection_ids_initial.insert(dest_id, conn);
         match self.connections[conn.0].handle_initial(
             &mut self.ctx,
@@ -977,11 +992,10 @@ impl Endpoint {
         &self.connections[conn.0].remote
     }
     pub fn get_protocol(&self, conn: ConnectionHandle) -> Option<&[u8]> {
-        if let State::Established(ref state) = *self.connections[conn.0].state.as_ref().unwrap() {
-            state.tls.get_alpn_protocol().map(|p| p.as_bytes())
-        } else {
-            None
-        }
+        self.connections[conn.0]
+            .tls
+            .get_alpn_protocol()
+            .map(|p| p.as_bytes())
     }
     /// The number of bytes of packets containing retransmittable frames that have not been acknowleded or declared lost
     pub fn get_bytes_in_flight(&self, conn: ConnectionHandle) -> u64 {
@@ -998,11 +1012,7 @@ impl Endpoint {
     ///
     /// None if no name was supplied or if this connection was locally-initiated.
     pub fn get_server_name(&self, conn: ConnectionHandle) -> Option<&str> {
-        match *self.connections[conn.0].state.as_ref().unwrap() {
-            State::Handshake(ref state) => state.tls.get_sni_hostname(),
-            State::Established(ref state) => state.tls.get_sni_hostname(),
-            _ => None,
-        }
+        self.connections[conn.0].tls.get_sni_hostname()
     }
 
     /// Whether a previous session was successfully resumed by `conn`.
